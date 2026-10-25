@@ -1,6 +1,6 @@
 [workspace]
-resolver = "2"
-members = ["crates", "firmware"]
+resolver = "1"
+members = ["firmware"]
 
 # cargo build/run
 [profile.dev]
