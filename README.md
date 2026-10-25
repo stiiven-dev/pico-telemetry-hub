@@ -22,8 +22,8 @@ Wi-Fi-connected sensor node publishing BME280, MPU-6050, and SRF05 telemetry ove
 
 ## To-Do list
 
-- [ ] `cyw43` up, onboard LED blinks (finally — the one LED this whole series couldn't reach without it)
-- [ ] DHCP + ping, confirmed reachable on the local network
+- [x] `cyw43` up, onboard LED blinks (finally — the one LED this whole series couldn't reach without it)
+- [x] DHCP + ping, confirmed reachable on the local network
 - [ ] MQTT publish of one sensor (BME280, simplest to start)
 - [ ] all three sensors flowing through a shared `PubSubChannel`
 - [ ] serial provisioning console + flash-backed config store

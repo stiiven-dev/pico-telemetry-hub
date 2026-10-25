@@ -2,6 +2,7 @@
 .#*
 .gdb_history
 target/
+secrets.env
 
 # editor files
 .vscode/*
