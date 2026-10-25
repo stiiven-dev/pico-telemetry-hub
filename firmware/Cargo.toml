@@ -1,0 +1,44 @@
+[package]
+edition = "2021"
+name = "pico-telemetry-hub"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+srf05 = { path = "../crates/srf05" }
+motion-core = { path = "../crates/motion-core" }
+cortex-m = "0.7.9"
+cortex-m-rt = "0.7"
+embedded-hal = { version = "1.0.0" }
+rp2040-hal = { version = "0.11.0", features = [
+    "rt",
+    "critical-section-impl",
+    "rtic-monotonic",
+] }
+embedded-io = "0.7"
+heapless = "0.9.3"
+embedded-hal-bus = "0.3.0"
+
+defmt = "1.1.1"
+defmt-serial = "0.14.0"
+usb-device = "0.3"
+usbd-serial = "0.2"
+
+panic-persist = { version = "0.3", features = ["utf8"] }
+rp2040-boot2 = "0.3.0"
+sequential-storage = "8.0.1"
+embedded-storage-async = "0.4.2"
+rp2040-flash = "0.6.0"
+
+critical-section = "1.2.0"
+static_cell = "2.1.1"
+portable-atomic = { version = "1", default-features = false, features = [
+    "critical-section",
+] }
+
+rtic = { version = "2.3.1", features = ["thumbv6-backend"] }
+rtic-monotonics = { version = "2.2.1", features = ["rp2040"] }
+embedded-graphics = "0.8.2"
+ssd1306 = "0.10.0"
+
+panic-halt = "1.0.0"
