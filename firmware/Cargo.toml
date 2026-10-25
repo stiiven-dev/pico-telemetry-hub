@@ -16,7 +16,7 @@ embassy-rp = { version = "0.10.0", features = [
     "critical-section-impl",
     "executor-thread",
 ] }
-embassy-net = { version = "0.9.1", features = ["dhcpv4", "medium-ethernet", "proto-ipv4", "auto-icmp-echo-reply"] }
+embassy-net = { version = "0.9.1", features = ["dhcpv4", "medium-ethernet", "proto-ipv4", "auto-icmp-echo-reply","tcp"] }
 embassy-futures = "0.1.2"
 cyw43 = "0.7.0"
 cyw43-pio = "0.10.0"

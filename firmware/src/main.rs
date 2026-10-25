@@ -1,15 +1,19 @@
 #![no_std]
 #![no_main]
 
+use core::net::Ipv4Addr;
+use core::str::FromStr;
+
 use cyw43::{aligned_bytes, JoinOptions};
 use cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER};
 use embassy_executor::Spawner;
-use embassy_net::{Config, StackResources};
+use embassy_net::{tcp::TcpSocket, Config, Ipv4Address, StackResources};
+use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_rp::{bind_interrupts, dma};
-use embassy_time::Timer;
+use embassy_time::{Duration, Timer};
 use panic_persist as _;
 use static_cell::StaticCell;
 
@@ -21,8 +25,11 @@ const PASS: &str = match option_env!("WIFI_PASS") {
     Some(s) => s,
     None => "",
 };
-// TODO(step 3): fixed seed is fine for DHCP/ping, not for TCP — use real entropy
-const NET_SEED: u64 = 0x0123_4567_89ab_cdef;
+const BROKER_IP: &str = match option_env!("BROKER_IP") {
+    Some(s) => s,
+    None => "",
+};
+const BROKER_PORT: u16 = 1883;
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
@@ -48,6 +55,14 @@ async fn blink_n(control: &mut cyw43::Control<'_>, n: u8) {
         control.gpio_set(0, false).await;
         Timer::after_millis(150).await;
     }
+}
+
+fn rosc_seed() -> u64 {
+    let mut s = 0u64;
+    for _ in 0..8 {
+        s = (s << 8) | RoscRng::next_u8() as u64;
+    }
+    s
 }
 
 #[embassy_executor::main(
@@ -98,7 +113,7 @@ async fn main(spawner: Spawner) {
         net_device,
         Config::dhcpv4(Default::default()),
         RESOURCES.init(StackResources::new()),
-        NET_SEED,
+        rosc_seed(),
     );
 
     spawner.spawn(net_task(net_runner).unwrap());
@@ -120,6 +135,38 @@ async fn main(spawner: Spawner) {
     control.gpio_set(0, true).await; // solid on = has IP
 
     loop {
-        Timer::after_secs(60).await;
+        let ip = match Ipv4Addr::from_str(BROKER_IP) {
+            Ok(ip) => ip,
+            Err(_) => loop {
+                // missing or invalid BROKER_IP: 7 blinks, repeat
+                blink_n(&mut control, 7).await;
+                Timer::after_secs(2).await;
+            },
+        };
+        let o = ip.octets();
+        let broker = (Ipv4Address::new(o[0], o[1], o[2], o[3]), BROKER_PORT);
+
+        let mut rx_buf = [0u8; 512];
+        let mut tx_buf = [0u8; 512];
+
+        loop {
+            let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
+            socket.set_timeout(Some(Duration::from_secs(10)));
+
+            match socket.connect(broker).await {
+                Ok(()) => {
+                    stage.set_high();
+                    Timer::after_secs(5).await;
+                    socket.abort();
+                    let _ = socket.flush().await;
+                    stage.set_low();
+                }
+                Err(_) => {
+                    blink_n(&mut control, 2).await;
+                    control.gpio_set(0, true).await;
+                }
+            }
+            Timer::after_secs(3).await;
+        }
     }
 }
