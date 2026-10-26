@@ -5,16 +5,21 @@ use core::fmt::Write as _;
 use core::net::Ipv4Addr;
 use core::str::FromStr;
 
+use bme280_rs::{AsyncBme280, Configuration, Oversampling, SensorMode, CHIP_ID};
+
 use cyw43::{aligned_bytes, JoinOptions};
 use cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER};
 use embassy_executor::Spawner;
 use embassy_net::{tcp::TcpSocket, Config, Ipv4Address, StackResources};
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
-use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0};
+use embassy_rp::i2c::{self, I2c};
+use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, I2C0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_rp::{bind_interrupts, dma};
-use embassy_time::{with_timeout, Duration, Timer};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
+use embassy_time::{with_timeout, Delay, Duration, Timer};
 use panic_persist as _;
 use static_cell::StaticCell;
 
@@ -35,7 +40,68 @@ const BROKER_PORT: u16 = 1883;
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
     DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0> , dma::InterruptHandler<DMA_CH1>;
+    I2C0_IRQ => i2c::InterruptHandler<I2C0>;
 });
+
+#[derive(Clone, Copy)]
+struct Bme280Reading {
+    temp_c: f32,
+    rh: f32,
+    press_hpa: f32,
+}
+
+#[derive(Clone, Copy)]
+enum SensorEvent {
+    Reading(Bme280Reading),
+    Error(&'static str),
+}
+
+static SENSOR_SIG: Signal<CriticalSectionRawMutex, SensorEvent> = Signal::new();
+
+#[embassy_executor::task]
+async fn bme280_task(i2c: I2c<'static, I2C0, i2c::Async>) {
+    let mut bme = AsyncBme280::new(i2c, Delay); // default address, 0x76 on most boards
+
+    // Bring-up: retry forever, saying why each time
+    loop {
+        match bme.chip_id().await {
+            Err(_) => SENSOR_SIG.signal(SensorEvent::Error("bme280: no i2c response")),
+            Ok(id) if id != CHIP_ID => {
+                SENSOR_SIG.signal(SensorEvent::Error("bme280: wrong chip id (BMP280?)"))
+            }
+            Ok(_) => {
+                let cfg = Configuration::default()
+                    .with_temperature_oversampling(Oversampling::Oversample1)
+                    .with_pressure_oversampling(Oversampling::Oversample1)
+                    .with_humidity_oversampling(Oversampling::Oversample1)
+                    .with_sensor_mode(SensorMode::Normal);
+                if bme.init().await.is_ok() && bme.set_sampling_configuration(cfg).await.is_ok() {
+                    break;
+                }
+                SENSOR_SIG.signal(SensorEvent::Error("bme280: init failed"));
+            }
+        }
+        Timer::after_secs(5).await;
+    }
+    Timer::after_millis(50).await; // let the first conversion finish
+
+    loop {
+        match bme.read_sample().await {
+            Ok(s) => match (s.temperature, s.pressure, s.humidity) {
+                (Some(t), Some(p), Some(h)) => {
+                    SENSOR_SIG.signal(SensorEvent::Reading(Bme280Reading {
+                        temp_c: t,
+                        rh: h,
+                        press_hpa: p / 100.0,
+                    }))
+                }
+                _ => SENSOR_SIG.signal(SensorEvent::Error("bme280: measurement disabled")),
+            },
+            Err(_) => SENSOR_SIG.signal(SensorEvent::Error("bme280: read failed")),
+        }
+        Timer::after_secs(2).await;
+    }
+}
 
 #[embassy_executor::task]
 async fn cyw43_task(
@@ -113,17 +179,25 @@ async fn mqtt_session(
     log::info!("mqtt connected");
     stage.set_high(); // GP13 on = MQTT session up
 
-    let mut count = 0u32;
     loop {
-        let mut payload: heapless::String<32> = heapless::String::new();
-        let _ = write!(payload, "hello {}", count);
-        let n = mqtt_lite::publish(&mut pkt, "hub/test", payload.as_bytes(), false)
-            .map_err(|_| "encode publish")?;
+        let n = match SENSOR_SIG.wait().await {
+            SensorEvent::Reading(r) => {
+                let mut p: heapless::String<96> = heapless::String::new();
+                let _ = write!(
+                    p,
+                    "{{\"t_c\":{:.2},\"rh\":{:.1},\"p_hpa\":{:.1}}}",
+                    r.temp_c, r.rh, r.press_hpa
+                );
+                mqtt_lite::publish(&mut pkt, "hub/bme280", p.as_bytes(), false)
+            }
+            SensorEvent::Error(msg) => {
+                mqtt_lite::publish(&mut pkt, "hub/log", msg.as_bytes(), false)
+            }
+        }
+        .map_err(|_| "encode publish")?;
         send_all(socket, &pkt[..n])
             .await
             .map_err(|_| "send publish")?;
-        count += 1;
-        Timer::after_secs(2).await;
     }
 }
 
@@ -137,6 +211,9 @@ async fn main(spawner: Spawner) {
     // GP12: reset button when pressed
     let btn = Input::new(p.PIN_12, Pull::Up);
     spawner.spawn(bootsel_task(btn).unwrap());
+
+    let i2c = I2c::new_async(p.I2C0, p.PIN_5, p.PIN_4, Irqs, i2c::Config::default()); // scl, sda
+    spawner.spawn(bme280_task(i2c).unwrap());
 
     log::info!("boot: pico-telemetry-hub");
     if let Some(msg) = panic_persist::get_panic_message_utf8() {

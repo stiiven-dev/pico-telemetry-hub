@@ -19,6 +19,7 @@ embassy-rp = { version = "0.10.0", features = [
 ] }
 embassy-net = { version = "0.9.1", features = ["dhcpv4", "medium-ethernet", "proto-ipv4", "auto-icmp-echo-reply","tcp"] }
 embassy-futures = "0.1.2"
+embassy-sync = "0.8.0"
 log = "0.4"
 cyw43 = "0.7.0"
 cyw43-pio = "0.10.0"
@@ -45,3 +46,4 @@ portable-atomic = { version = "1", default-features = false, features = [
 
 #embedded-graphics = "0.8.2"
 #ssd1306 = "0.10.0"
+bme280-rs = {version = "0.4.1", default-features = false , features = ["async"] }

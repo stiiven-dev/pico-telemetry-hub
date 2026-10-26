@@ -108,6 +108,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bme280-rs"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f559aa576a32704987d14a5d6808f7956847b14bc635311e855cb003d2a281c"
+dependencies = [
+ "embedded-hal-async",
+]
+
+[[package]]
 name = "bytemuck"
 version = "1.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1091,6 +1100,7 @@ checksum = "5be167a7af36ee22fe3115051bc51f6e6c7054c9348e28deb4f49bd6f705a315"
 name = "pico-telemetry-hub"
 version = "0.1.0"
 dependencies = [
+ "bme280-rs",
  "cortex-m",
  "cortex-m-rt",
  "critical-section",
@@ -1100,6 +1110,7 @@ dependencies = [
  "embassy-futures",
  "embassy-net",
  "embassy-rp",
+ "embassy-sync",
  "embassy-time",
  "heapless",
  "log",
