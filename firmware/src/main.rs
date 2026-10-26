@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+use core::fmt::Write as _;
 use core::net::Ipv4Addr;
 use core::str::FromStr;
 
@@ -9,11 +10,11 @@ use cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER};
 use embassy_executor::Spawner;
 use embassy_net::{tcp::TcpSocket, Config, Ipv4Address, StackResources};
 use embassy_rp::clocks::RoscRng;
-use embassy_rp::gpio::{Level, Output};
+use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_rp::{bind_interrupts, dma};
-use embassy_time::{Duration, Timer};
+use embassy_time::{with_timeout, Duration, Timer};
 use panic_persist as _;
 use static_cell::StaticCell;
 
@@ -48,6 +49,12 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
     runner.run().await
 }
 
+#[embassy_executor::task]
+async fn bootsel_task(mut btn: embassy_rp::gpio::Input<'static>) {
+    btn.wait_for_low().await;
+    embassy_rp::rom_data::reset_to_usb_boot(0, 0);
+}
+
 async fn blink_n(control: &mut cyw43::Control<'_>, n: u8) {
     for _ in 0..n {
         control.gpio_set(0, true).await;
@@ -65,12 +72,76 @@ fn rosc_seed() -> u64 {
     s
 }
 
+async fn send_all(socket: &mut TcpSocket<'_>, mut data: &[u8]) -> Result<(), ()> {
+    while !data.is_empty() {
+        match socket.write(data).await {
+            Ok(0) | Err(_) => return Err(()),
+            Ok(n) => data = &data[n..],
+        }
+    }
+    Ok(())
+}
+
+async fn read_exact(socket: &mut TcpSocket<'_>, buf: &mut [u8]) -> Result<(), ()> {
+    let mut got = 0;
+    while got < buf.len() {
+        match socket.read(&mut buf[got..]).await {
+            Ok(0) | Err(_) => return Err(()),
+            Ok(n) => got += n,
+        }
+    }
+    Ok(())
+}
+
+async fn mqtt_session(
+    socket: &mut TcpSocket<'_>,
+    stage: &mut Output<'_>,
+) -> Result<(), &'static str> {
+    let mut pkt = [0u8; 128];
+
+    let n = mqtt_lite::connect(&mut pkt, "pico-telemetry-hub", 60).map_err(|_| "encode connect")?;
+    send_all(socket, &pkt[..n])
+        .await
+        .map_err(|_| "send connect")?;
+
+    let mut ack = [0u8; 4];
+    with_timeout(Duration::from_secs(5), read_exact(socket, &mut ack))
+        .await
+        .map_err(|_| "connack timeout")?
+        .map_err(|_| "connack read")?;
+    mqtt_lite::check_connack(&ack).map_err(|_| "connack refused")?;
+    log::info!("mqtt connected");
+    stage.set_high(); // GP13 on = MQTT session up
+
+    let mut count = 0u32;
+    loop {
+        let mut payload: heapless::String<32> = heapless::String::new();
+        let _ = write!(payload, "hello {}", count);
+        let n = mqtt_lite::publish(&mut pkt, "hub/test", payload.as_bytes(), false)
+            .map_err(|_| "encode publish")?;
+        send_all(socket, &pkt[..n])
+            .await
+            .map_err(|_| "send publish")?;
+        count += 1;
+        Timer::after_secs(2).await;
+    }
+}
+
 #[embassy_executor::main(
     executor = "embassy_rp::executor::Executor",
     entry = "cortex_m_rt::entry"
 )]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
+
+    // GP12: reset button when pressed
+    let btn = Input::new(p.PIN_12, Pull::Up);
+    spawner.spawn(bootsel_task(btn).unwrap());
+
+    log::info!("boot: pico-telemetry-hub");
+    if let Some(msg) = panic_persist::get_panic_message_utf8() {
+        log::error!("previous run panicked: {}", msg);
+    }
 
     // GP13: high while the Wi-Fi chip is coming up; stuck high = hung in bring-up
     let mut stage = Output::new(p.PIN_13, Level::High);
@@ -98,7 +169,10 @@ async fn main(spawner: Spawner) {
     let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
 
     spawner.spawn(cyw43_task(runner).unwrap());
+
     control.init(clm).await;
+    log::info!("cyw43 initialised");
+
     stage.set_low();
     if SSID.is_empty() {
         // built without credentials: 5 blinks, repeat forever
@@ -120,8 +194,12 @@ async fn main(spawner: Spawner) {
 
     loop {
         match control.join(SSID, JoinOptions::new(PASS.as_bytes())).await {
-            Ok(_) => break,
-            Err(_) => {
+            Ok(_) => {
+                log::info!("joined '{}'", SSID);
+                break;
+            }
+            Err(e) => {
+                log::warn!("join failed: {:?}", e);
                 blink_n(&mut control, 3).await;
                 Timer::after_secs(2).await;
             }
@@ -131,6 +209,9 @@ async fn main(spawner: Spawner) {
     // Fast blink while waiting for link + DHCP lease; each blink runs to completion
     while !(stack.is_link_up() && stack.is_config_up()) {
         blink_n(&mut control, 1).await;
+    }
+    if let Some(cfg) = stack.config_v4() {
+        log::info!("got IP {}", cfg.address);
     }
     control.gpio_set(0, true).await; // solid on = has IP
 
@@ -150,18 +231,24 @@ async fn main(spawner: Spawner) {
         let mut tx_buf = [0u8; 512];
 
         loop {
+            log::info!("connecting to broker...");
             let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
             socket.set_timeout(Some(Duration::from_secs(10)));
 
             match socket.connect(broker).await {
                 Ok(()) => {
-                    stage.set_high();
-                    Timer::after_secs(5).await;
+                    log::info!("tcp connected");
+                    if let Err(why) = mqtt_session(&mut socket, &mut stage).await {
+                        log::warn!("mqtt session ended: {}", why);
+                        blink_n(&mut control, 4).await; // 4 blinks = MQTT session failed
+                        control.gpio_set(0, true).await;
+                    }
+                    stage.set_low();
                     socket.abort();
                     let _ = socket.flush().await;
-                    stage.set_low();
                 }
-                Err(_) => {
+                Err(e) => {
+                    log::warn!("tcp connect failed: {:?}", e);
                     blink_n(&mut control, 2).await;
                     control.gpio_set(0, true).await;
                 }

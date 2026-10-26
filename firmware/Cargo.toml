@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 #srf05 = { path = "../crates/srf05" }
 #motion-core = { path = "../crates/motion-core" }
+mqtt-lite = { path = "../crates/mqtt-lite" }
 
 embassy-executor = "0.10.0"
 embassy-time = "0.5.1"
@@ -18,6 +19,7 @@ embassy-rp = { version = "0.10.0", features = [
 ] }
 embassy-net = { version = "0.9.1", features = ["dhcpv4", "medium-ethernet", "proto-ipv4", "auto-icmp-echo-reply","tcp"] }
 embassy-futures = "0.1.2"
+log = "0.4"
 cyw43 = "0.7.0"
 cyw43-pio = "0.10.0"
 
@@ -26,7 +28,7 @@ cortex-m-rt = "0.7"
 #embedded-hal = { version = "1.0.0" }
 #embedded-io = "0.7"
 #embedded-hal-bus = "0.3.0"
-#heapless = "0.9.3"
+heapless = "0.9.3"
 
 #defmt = "1.1.1"
 #defmt-serial = "0.14.0"

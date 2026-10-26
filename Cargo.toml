@@ -1,6 +1,6 @@
 [workspace]
-resolver = "1"
-members = ["firmware"]
+resolver = "2"
+members = ["firmware","crates/mqtt-lite"]
 
 # cargo build/run
 [profile.dev]
