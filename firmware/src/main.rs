@@ -1,11 +1,14 @@
 #![no_std]
 #![no_main]
 
+mod imu;
+
 use core::fmt::Write as _;
 use core::net::Ipv4Addr;
 use core::str::FromStr;
 
 use bme280_rs::{AsyncBme280, Configuration, Oversampling, SensorMode, CHIP_ID};
+use motion_core::{Calibrator, ComplementaryFilter};
 
 use cyw43::{aligned_bytes, JoinOptions};
 use cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER};
@@ -21,7 +24,7 @@ use embassy_rp::{bind_interrupts, dma};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::pubsub::{PubSubChannel, Subscriber};
-use embassy_time::{with_timeout, Delay, Duration, Timer};
+use embassy_time::{with_timeout, Delay, Duration, Instant, Timer};
 use panic_persist as _;
 use static_cell::StaticCell;
 
@@ -55,6 +58,10 @@ enum Measurement {
         temp_c: f32,
         rh: f32,
         press_hpa: f32,
+    },
+    Attitude {
+        pitch_deg: f32,
+        roll_deg: f32,
     },
     Log(&'static str),
 }
@@ -104,6 +111,81 @@ async fn bme280_task(i2c: SharedI2c) {
             Err(_) => tx.publish_immediate(Measurement::Log("bme280: read failed")),
         }
         Timer::after_secs(2).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn imu_task(mut i2c: SharedI2c, mut int: Input<'static>) {
+    let tx = TELEMETRY.immediate_publisher();
+
+    loop {
+        match imu::init(&mut i2c).await {
+            Ok(()) => break,
+            Err(imu::Error::UnexpectedWhoAmI(_)) => {
+                tx.publish_immediate(Measurement::Log("imu: unexpected WHO_AM_I"))
+            }
+            Err(_) => tx.publish_immediate(Measurement::Log("imu: no i2c response")),
+        }
+        Timer::after_secs(5).await;
+    }
+
+    tx.publish_immediate(Measurement::Log("imu: calibrating, keep still and level"));
+    let mut calibrator = Calibrator::<200>::new();
+    let cal = loop {
+        if with_timeout(Duration::from_millis(100), int.wait_for_rising_edge())
+            .await
+            .is_err()
+        {
+            tx.publish_immediate(Measurement::Log("imu: no data-ready interrupt"));
+            Timer::after_secs(2).await;
+            continue;
+        }
+        match imu::read(&mut i2c).await {
+            Ok((accel, gyro)) => {
+                if let Some(c) = calibrator.push(gyro, accel) {
+                    break c;
+                }
+            }
+            Err(_) => tx.publish_immediate(Measurement::Log("imu: read failed")),
+        }
+    };
+    tx.publish_immediate(Measurement::Log("imu: calibration done"));
+
+    let mut filter = ComplementaryFilter::new(0.98);
+    let mut last = Instant::now();
+    let mut n: u32 = 0;
+    loop {
+        if with_timeout(Duration::from_millis(100), int.wait_for_rising_edge())
+            .await
+            .is_err()
+        {
+            tx.publish_immediate(Measurement::Log("imu: no data-ready interrupt"));
+            Timer::after_secs(2).await;
+            continue;
+        }
+        let (accel, gyro) = match imu::read(&mut i2c).await {
+            Ok(s) => s,
+            Err(_) => {
+                tx.publish_immediate(Measurement::Log("imu: read failed"));
+                continue;
+            }
+        };
+        let now = Instant::now();
+        let dt = (now - last).as_micros() as f32 / 1_000_000.0;
+        last = now;
+
+        let accel_g = cal.correct_accel(accel).accel_to_g();
+        let gyro_dps = cal.correct_gyro(gyro).gyro_to_dps();
+        // TODO: apply the same gyro axis inversion your RTIC firmware needed
+        let att = filter.update(dt, gyro_dps, accel_g);
+
+        n += 1;
+        if n % 20 == 0 {
+            tx.publish_immediate(Measurement::Attitude {
+                pitch_deg: att.pitch_deg,
+                roll_deg: att.roll_deg,
+            }); // every 20th sample at 100 Hz = 5 Hz
+        }
     }
 }
 
@@ -201,6 +283,14 @@ async fn mqtt_session(
                 );
                 mqtt_lite::publish(&mut pkt, "hub/bme280", p.as_bytes(), false)
             }
+            Measurement::Attitude {
+                pitch_deg,
+                roll_deg,
+            } => {
+                let mut p: heapless::String<64> = heapless::String::new();
+                let _ = write!(p, "{{\"pitch\":{:.1},\"roll\":{:.1}}}", pitch_deg, roll_deg);
+                mqtt_lite::publish(&mut pkt, "hub/imu", p.as_bytes(), false)
+            }
             Measurement::Log(msg) => mqtt_lite::publish(&mut pkt, "hub/log", msg.as_bytes(), false),
         }
         .map_err(|_| "encode publish")?;
@@ -225,6 +315,9 @@ async fn main(spawner: Spawner) {
     let i2c = I2c::new_async(p.I2C0, p.PIN_5, p.PIN_4, Irqs, i2c::Config::default());
     let bus: &'static I2cBus = I2C_BUS.init(Mutex::new(i2c));
     spawner.spawn(bme280_task(I2cDevice::new(bus)).unwrap());
+
+    let imu_int = Input::new(p.PIN_16, Pull::None);
+    spawner.spawn(imu_task(I2cDevice::new(bus), imu_int).unwrap());
 
     log::info!("boot: pico-telemetry-hub");
     if let Some(msg) = panic_persist::get_panic_message_utf8() {
