@@ -9,6 +9,7 @@ use bme280_rs::{AsyncBme280, Configuration, Oversampling, SensorMode, CHIP_ID};
 
 use cyw43::{aligned_bytes, JoinOptions};
 use cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER};
+use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
 use embassy_executor::Spawner;
 use embassy_net::{tcp::TcpSocket, Config, Ipv4Address, StackResources};
 use embassy_rp::clocks::RoscRng;
@@ -18,7 +19,8 @@ use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, I2C0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_rp::{bind_interrupts, dma};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::signal::Signal;
+use embassy_sync::mutex::Mutex;
+use embassy_sync::pubsub::{PubSubChannel, Subscriber};
 use embassy_time::{with_timeout, Delay, Duration, Timer};
 use panic_persist as _;
 use static_cell::StaticCell;
@@ -43,31 +45,35 @@ bind_interrupts!(struct Irqs {
     I2C0_IRQ => i2c::InterruptHandler<I2C0>;
 });
 
-#[derive(Clone, Copy)]
-struct Bme280Reading {
-    temp_c: f32,
-    rh: f32,
-    press_hpa: f32,
-}
+type I2cBus = Mutex<CriticalSectionRawMutex, I2c<'static, I2C0, i2c::Async>>;
+type SharedI2c = I2cDevice<'static, CriticalSectionRawMutex, I2c<'static, I2C0, i2c::Async>>;
+static I2C_BUS: StaticCell<I2cBus> = StaticCell::new();
 
 #[derive(Clone, Copy)]
-enum SensorEvent {
-    Reading(Bme280Reading),
-    Error(&'static str),
+enum Measurement {
+    Bme280 {
+        temp_c: f32,
+        rh: f32,
+        press_hpa: f32,
+    },
+    Log(&'static str),
 }
 
-static SENSOR_SIG: Signal<CriticalSectionRawMutex, SensorEvent> = Signal::new();
+// 8 queued messages, 2 subscribers (uplink, display), 4 publishers (3 sensors + spare)
+static TELEMETRY: PubSubChannel<CriticalSectionRawMutex, Measurement, 8, 2, 4> =
+    PubSubChannel::new();
+type TelemetrySub = Subscriber<'static, CriticalSectionRawMutex, Measurement, 8, 2, 4>;
 
 #[embassy_executor::task]
-async fn bme280_task(i2c: I2c<'static, I2C0, i2c::Async>) {
-    let mut bme = AsyncBme280::new(i2c, Delay); // default address, 0x76 on most boards
+async fn bme280_task(i2c: SharedI2c) {
+    let tx = TELEMETRY.immediate_publisher();
+    let mut bme = AsyncBme280::new(i2c, Delay);
 
-    // Bring-up: retry forever, saying why each time
     loop {
         match bme.chip_id().await {
-            Err(_) => SENSOR_SIG.signal(SensorEvent::Error("bme280: no i2c response")),
+            Err(_) => tx.publish_immediate(Measurement::Log("bme280: no i2c response")),
             Ok(id) if id != CHIP_ID => {
-                SENSOR_SIG.signal(SensorEvent::Error("bme280: wrong chip id (BMP280?)"))
+                tx.publish_immediate(Measurement::Log("bme280: wrong chip ID (BMP280??)"))
             }
             Ok(_) => {
                 let cfg = Configuration::default()
@@ -78,26 +84,24 @@ async fn bme280_task(i2c: I2c<'static, I2C0, i2c::Async>) {
                 if bme.init().await.is_ok() && bme.set_sampling_configuration(cfg).await.is_ok() {
                     break;
                 }
-                SENSOR_SIG.signal(SensorEvent::Error("bme280: init failed"));
+                tx.publish_immediate(Measurement::Log("bme280: init failed"));
             }
         }
         Timer::after_secs(5).await;
     }
-    Timer::after_millis(50).await; // let the first conversion finish
+    Timer::after_millis(50).await;
 
     loop {
         match bme.read_sample().await {
-            Ok(s) => match (s.temperature, s.pressure, s.humidity) {
-                (Some(t), Some(p), Some(h)) => {
-                    SENSOR_SIG.signal(SensorEvent::Reading(Bme280Reading {
-                        temp_c: t,
-                        rh: h,
-                        press_hpa: p / 100.0,
-                    }))
-                }
-                _ => SENSOR_SIG.signal(SensorEvent::Error("bme280: measurement disabled")),
+            Ok(s) => match (s.temperature, s.humidity, s.pressure) {
+                (Some(t), Some(h), Some(p)) => tx.publish_immediate(Measurement::Bme280 {
+                    temp_c: t,
+                    rh: h,
+                    press_hpa: p / 100.0,
+                }),
+                _ => tx.publish_immediate(Measurement::Log("bme280: measurement disabled")),
             },
-            Err(_) => SENSOR_SIG.signal(SensorEvent::Error("bme280: read failed")),
+            Err(_) => tx.publish_immediate(Measurement::Log("bme280: read failed")),
         }
         Timer::after_secs(2).await;
     }
@@ -162,6 +166,7 @@ async fn read_exact(socket: &mut TcpSocket<'_>, buf: &mut [u8]) -> Result<(), ()
 async fn mqtt_session(
     socket: &mut TcpSocket<'_>,
     stage: &mut Output<'_>,
+    sub: &mut TelemetrySub,
 ) -> Result<(), &'static str> {
     let mut pkt = [0u8; 128];
 
@@ -179,20 +184,24 @@ async fn mqtt_session(
     log::info!("mqtt connected");
     stage.set_high(); // GP13 on = MQTT session up
 
+    while sub.try_next_message_pure().is_some() {} // drop reading queued while offline
+
     loop {
-        let n = match SENSOR_SIG.wait().await {
-            SensorEvent::Reading(r) => {
+        let n = match sub.next_message_pure().await {
+            Measurement::Bme280 {
+                temp_c,
+                rh,
+                press_hpa,
+            } => {
                 let mut p: heapless::String<96> = heapless::String::new();
                 let _ = write!(
                     p,
                     "{{\"t_c\":{:.2},\"rh\":{:.1},\"p_hpa\":{:.1}}}",
-                    r.temp_c, r.rh, r.press_hpa
+                    temp_c, rh, press_hpa
                 );
                 mqtt_lite::publish(&mut pkt, "hub/bme280", p.as_bytes(), false)
             }
-            SensorEvent::Error(msg) => {
-                mqtt_lite::publish(&mut pkt, "hub/log", msg.as_bytes(), false)
-            }
+            Measurement::Log(msg) => mqtt_lite::publish(&mut pkt, "hub/log", msg.as_bytes(), false),
         }
         .map_err(|_| "encode publish")?;
         send_all(socket, &pkt[..n])
@@ -212,8 +221,10 @@ async fn main(spawner: Spawner) {
     let btn = Input::new(p.PIN_12, Pull::Up);
     spawner.spawn(bootsel_task(btn).unwrap());
 
-    let i2c = I2c::new_async(p.I2C0, p.PIN_5, p.PIN_4, Irqs, i2c::Config::default()); // scl, sda
-    spawner.spawn(bme280_task(i2c).unwrap());
+    // I2C
+    let i2c = I2c::new_async(p.I2C0, p.PIN_5, p.PIN_4, Irqs, i2c::Config::default());
+    let bus: &'static I2cBus = I2C_BUS.init(Mutex::new(i2c));
+    spawner.spawn(bme280_task(I2cDevice::new(bus)).unwrap());
 
     log::info!("boot: pico-telemetry-hub");
     if let Some(msg) = panic_persist::get_panic_message_utf8() {
@@ -306,6 +317,7 @@ async fn main(spawner: Spawner) {
 
         let mut rx_buf = [0u8; 512];
         let mut tx_buf = [0u8; 512];
+        let mut sub: TelemetrySub = TELEMETRY.subscriber().unwrap();
 
         loop {
             log::info!("connecting to broker...");
@@ -315,7 +327,7 @@ async fn main(spawner: Spawner) {
             match socket.connect(broker).await {
                 Ok(()) => {
                     log::info!("tcp connected");
-                    if let Err(why) = mqtt_session(&mut socket, &mut stage).await {
+                    if let Err(why) = mqtt_session(&mut socket, &mut stage, &mut sub).await {
                         log::warn!("mqtt session ended: {}", why);
                         blink_n(&mut control, 4).await; // 4 blinks = MQTT session failed
                         control.gpio_set(0, true).await;

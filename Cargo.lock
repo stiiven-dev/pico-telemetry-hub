@@ -1106,6 +1106,7 @@ dependencies = [
  "critical-section",
  "cyw43",
  "cyw43-pio",
+ "embassy-embedded-hal",
  "embassy-executor",
  "embassy-futures",
  "embassy-net",
