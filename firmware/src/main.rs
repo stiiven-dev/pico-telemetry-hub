@@ -6,9 +6,11 @@ mod imu;
 use core::fmt::Write as _;
 use core::net::Ipv4Addr;
 use core::str::FromStr;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use bme280_rs::{AsyncBme280, Configuration, Oversampling, SensorMode, CHIP_ID};
-use motion_core::{Calibrator, ComplementaryFilter};
+use motion_core::{Calibrator, ComplementaryFilter, MedianFilter, NO_READING};
+use srf05::{EdgeCapture, Reading};
 
 use cyw43::{aligned_bytes, JoinOptions};
 use cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER};
@@ -24,7 +26,7 @@ use embassy_rp::{bind_interrupts, dma};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::pubsub::{PubSubChannel, Subscriber};
-use embassy_time::{with_timeout, Delay, Duration, Instant, Timer};
+use embassy_time::{block_for, with_timeout, Delay, Duration, Instant, Timer};
 use panic_persist as _;
 use static_cell::StaticCell;
 
@@ -41,6 +43,7 @@ const BROKER_IP: &str = match option_env!("BROKER_IP") {
     None => "",
 };
 const BROKER_PORT: u16 = 1883;
+const RANGE_MEDIAN_N: usize = 5; //must be odd
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
@@ -51,6 +54,7 @@ bind_interrupts!(struct Irqs {
 type I2cBus = Mutex<CriticalSectionRawMutex, I2c<'static, I2C0, i2c::Async>>;
 type SharedI2c = I2cDevice<'static, CriticalSectionRawMutex, I2c<'static, I2C0, i2c::Async>>;
 static I2C_BUS: StaticCell<I2cBus> = StaticCell::new();
+static UPLINK_UP: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 enum Measurement {
@@ -62,6 +66,9 @@ enum Measurement {
     Attitude {
         pitch_deg: f32,
         roll_deg: f32,
+    },
+    Range {
+        mm: Option<u16>,
     },
     Log(&'static str),
 }
@@ -117,6 +124,10 @@ async fn bme280_task(i2c: SharedI2c) {
 #[embassy_executor::task]
 async fn imu_task(mut i2c: SharedI2c, mut int: Input<'static>) {
     let tx = TELEMETRY.immediate_publisher();
+
+    while !UPLINK_UP.load(Ordering::Acquire) {
+        Timer::after_millis(200).await;
+    }
 
     loop {
         match imu::init(&mut i2c).await {
@@ -186,6 +197,55 @@ async fn imu_task(mut i2c: SharedI2c, mut int: Input<'static>) {
                 roll_deg: att.roll_deg,
             }); // every 20th sample at 100 Hz = 5 Hz
         }
+    }
+}
+
+#[embassy_executor::task]
+async fn range_task(mut trig: Output<'static>, mut echo: Input<'static>) {
+    let tx = TELEMETRY.immediate_publisher();
+    let mut median = MedianFilter::<RANGE_MEDIAN_N>::new();
+
+    loop {
+        // ECHO must be idle-low before we ping
+        if with_timeout(Duration::from_millis(40), echo.wait_for_low())
+            .await
+            .is_err()
+        {
+            tx.publish_immediate(Measurement::Log("range: echo stuck high"));
+            Timer::after_secs(2).await;
+            continue;
+        }
+
+        trig.set_high();
+        block_for(Duration::from_micros(10));
+        trig.set_low();
+
+        let mut cap = EdgeCapture::new();
+        let timed_out = with_timeout(Duration::from_millis(40), async {
+            echo.wait_for_high().await;
+            cap.on_rise(Instant::now().as_micros());
+            echo.wait_for_low().await;
+            cap.on_fall(Instant::now().as_micros());
+        })
+        .await
+        .is_err();
+
+        let sample = if timed_out {
+            NO_READING
+        } else {
+            match cap.take_reading() {
+                Ok(Reading::Mm(mm)) => mm,
+                Ok(Reading::OutOfRange) | Err(_) => NO_READING,
+            }
+        };
+
+        if let Some(m) = median.push(sample) {
+            tx.publish_immediate(Measurement::Range {
+                mm: if m == NO_READING { None } else { Some(m) },
+            });
+        }
+
+        Timer::after_millis(200).await;
     }
 }
 
@@ -267,6 +327,7 @@ async fn mqtt_session(
     stage.set_high(); // GP13 on = MQTT session up
 
     while sub.try_next_message_pure().is_some() {} // drop reading queued while offline
+    UPLINK_UP.store(true, Ordering::Release);
 
     loop {
         let n = match sub.next_message_pure().await {
@@ -290,6 +351,14 @@ async fn mqtt_session(
                 let mut p: heapless::String<64> = heapless::String::new();
                 let _ = write!(p, "{{\"pitch\":{:.1},\"roll\":{:.1}}}", pitch_deg, roll_deg);
                 mqtt_lite::publish(&mut pkt, "hub/imu", p.as_bytes(), false)
+            }
+            Measurement::Range { mm } => {
+                let mut p: heapless::String<24> = heapless::String::new();
+                let _ = match mm {
+                    Some(v) => write!(p, "{{\"mm\":{}}}", v),
+                    None => write!(p, "{{\"mm\":null}}"),
+                };
+                mqtt_lite::publish(&mut pkt, "hub/range", p.as_bytes(), false)
             }
             Measurement::Log(msg) => mqtt_lite::publish(&mut pkt, "hub/log", msg.as_bytes(), false),
         }
@@ -318,6 +387,10 @@ async fn main(spawner: Spawner) {
 
     let imu_int = Input::new(p.PIN_16, Pull::None);
     spawner.spawn(imu_task(I2cDevice::new(bus), imu_int).unwrap());
+
+    let trig = Output::new(p.PIN_15, Level::Low);
+    let echo = Input::new(p.PIN_14, Pull::None);
+    spawner.spawn(range_task(trig, echo).unwrap());
 
     log::info!("boot: pico-telemetry-hub");
     if let Some(msg) = panic_persist::get_panic_message_utf8() {
@@ -425,6 +498,7 @@ async fn main(spawner: Spawner) {
                         blink_n(&mut control, 4).await; // 4 blinks = MQTT session failed
                         control.gpio_set(0, true).await;
                     }
+                    UPLINK_UP.store(false, Ordering::Release);
                     stage.set_low();
                     socket.abort();
                     let _ = socket.flush().await;

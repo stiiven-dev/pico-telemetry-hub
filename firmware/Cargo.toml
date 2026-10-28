@@ -5,7 +5,7 @@ version = "0.1.0"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-#srf05 = { path = "../crates/srf05" }
+srf05 = { path = "../crates/srf05" }
 motion-core = { path = "../crates/motion-core" }
 mqtt-lite = { path = "../crates/mqtt-lite" }
 
