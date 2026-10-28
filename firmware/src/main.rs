@@ -26,9 +26,17 @@ use embassy_rp::{bind_interrupts, dma};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::pubsub::{PubSubChannel, Subscriber};
-use embassy_time::{block_for, with_timeout, Delay, Duration, Instant, Timer};
+use embassy_time::{block_for, with_timeout, Delay, Duration, Instant, Ticker, Timer};
 use panic_persist as _;
 use static_cell::StaticCell;
+
+use embedded_graphics::{
+    mono_font::{ascii::FONT_6X10, MonoTextStyle},
+    pixelcolor::BinaryColor,
+    prelude::*,
+    text::{Baseline, Text},
+};
+use ssd1306::{prelude::*, I2CDisplayInterface, Ssd1306Async};
 
 const SSID: &str = match option_env!("WIFI_SSID") {
     Some(s) => s,
@@ -56,6 +64,12 @@ type SharedI2c = I2cDevice<'static, CriticalSectionRawMutex, I2c<'static, I2C0, 
 static I2C_BUS: StaticCell<I2cBus> = StaticCell::new();
 static UPLINK_UP: AtomicBool = AtomicBool::new(false);
 
+#[derive(Clone, Copy, PartialEq)]
+enum UplinkState {
+    Down,
+    Up,
+}
+
 #[derive(Clone, Copy)]
 enum Measurement {
     Bme280 {
@@ -70,6 +84,7 @@ enum Measurement {
     Range {
         mm: Option<u16>,
     },
+    Uplink(UplinkState),
     Log(&'static str),
 }
 
@@ -249,6 +264,136 @@ async fn range_task(mut trig: Output<'static>, mut echo: Input<'static>) {
     }
 }
 
+#[derive(Default)]
+struct Screen {
+    uplink_up: bool,
+    env: Option<(f32, f32, f32)>, // temp_c, rh, press_hpa
+    att: Option<(f32, f32)>,      // pitch, roll
+    range: Option<Option<u16>>,   // None = nothing received yet; Some(None) = out of range
+}
+
+fn put<D>(d: &mut D, y: i32, s: &str)
+where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
+    let _ = Text::with_baseline(s, Point::new(0, y), style, Baseline::Top).draw(d);
+}
+
+#[embassy_executor::task]
+async fn display_task(i2c: SharedI2c) {
+    let tx = TELEMETRY.immediate_publisher();
+    let mut sub: TelemetrySub = TELEMETRY.subscriber().unwrap();
+
+    let interface = I2CDisplayInterface::new(i2c);
+    let mut display = Ssd1306Async::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
+        .into_buffered_graphics_mode();
+
+    loop {
+        match display.init().await {
+            Ok(()) => break,
+            Err(_) => {
+                tx.publish_immediate(Measurement::Log("oled: init failed"));
+                Timer::after_secs(5).await;
+            }
+        }
+    }
+
+    let mut screen = Screen::default();
+    let mut flush_failed = false;
+    let mut tick = Ticker::every(Duration::from_millis(250));
+
+    loop {
+        // Fold in everything that arrived since the last redraw
+        while let Some(m) = sub.try_next_message_pure() {
+            match m {
+                Measurement::Bme280 {
+                    temp_c,
+                    rh,
+                    press_hpa,
+                } => screen.env = Some((temp_c, rh, press_hpa)),
+                Measurement::Attitude {
+                    pitch_deg,
+                    roll_deg,
+                } => screen.att = Some((pitch_deg, roll_deg)),
+                Measurement::Range { mm } => screen.range = Some(mm),
+                Measurement::Uplink(s) => screen.uplink_up = s == UplinkState::Up,
+                Measurement::Log(_) => {}
+            }
+        }
+
+        let _ = display.clear(BinaryColor::Off);
+        let mut s: heapless::String<32> = heapless::String::new();
+
+        let _ = write!(
+            s,
+            "hub   MQTT {}",
+            if screen.uplink_up { "up" } else { "down" }
+        );
+        put(&mut display, 0, &s);
+
+        s.clear();
+        match screen.env {
+            Some((t, rh, _)) => {
+                let _ = write!(s, "{:.1}C  {:.0}%RH", t, rh);
+            }
+            None => {
+                let _ = write!(s, "T --");
+            }
+        }
+        put(&mut display, 12, &s);
+
+        s.clear();
+        match screen.env {
+            Some((_, _, p)) => {
+                let _ = write!(s, "{:.1} hPa", p);
+            }
+            None => {
+                let _ = write!(s, "P --");
+            }
+        }
+        put(&mut display, 24, &s);
+
+        s.clear();
+        match screen.att {
+            Some((p, r)) => {
+                let _ = write!(s, "pit {:+.1} rol {:+.1}", p, r);
+            }
+            None => {
+                let _ = write!(s, "attitude --");
+            }
+        }
+        put(&mut display, 36, &s);
+
+        s.clear();
+        match screen.range {
+            Some(Some(mm)) => {
+                let _ = write!(s, "dist {} mm", mm);
+            }
+            Some(None) => {
+                let _ = write!(s, "dist out of range");
+            }
+            None => {
+                let _ = write!(s, "dist --");
+            }
+        }
+        put(&mut display, 48, &s);
+
+        // Report a flush failure once, not every 250 ms
+        match display.flush().await {
+            Ok(()) => flush_failed = false,
+            Err(_) => {
+                if !flush_failed {
+                    tx.publish_immediate(Measurement::Log("oled: flush failed"));
+                }
+                flush_failed = true;
+            }
+        }
+
+        tick.next().await;
+    }
+}
+
 #[embassy_executor::task]
 async fn cyw43_task(
     runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>>,
@@ -324,6 +469,12 @@ async fn mqtt_session(
         .map_err(|_| "connack read")?;
     mqtt_lite::check_connack(&ack).map_err(|_| "connack refused")?;
     log::info!("mqtt connected");
+    TELEMETRY
+        .immediate_publisher()
+        .publish_immediate(Measurement::Uplink(UplinkState::Up));
+    TELEMETRY
+        .immediate_publisher()
+        .publish_immediate(Measurement::Uplink(UplinkState::Up));
     stage.set_high(); // GP13 on = MQTT session up
 
     while sub.try_next_message_pure().is_some() {} // drop reading queued while offline
@@ -360,6 +511,7 @@ async fn mqtt_session(
                 };
                 mqtt_lite::publish(&mut pkt, "hub/range", p.as_bytes(), false)
             }
+            Measurement::Uplink(_) => continue,
             Measurement::Log(msg) => mqtt_lite::publish(&mut pkt, "hub/log", msg.as_bytes(), false),
         }
         .map_err(|_| "encode publish")?;
@@ -381,7 +533,9 @@ async fn main(spawner: Spawner) {
     spawner.spawn(bootsel_task(btn).unwrap());
 
     // I2C
-    let i2c = I2c::new_async(p.I2C0, p.PIN_5, p.PIN_4, Irqs, i2c::Config::default());
+    let mut i2c_cfg = i2c::Config::default();
+    i2c_cfg.frequency = 400_000;
+    let i2c = I2c::new_async(p.I2C0, p.PIN_5, p.PIN_4, Irqs, i2c_cfg);
     let bus: &'static I2cBus = I2C_BUS.init(Mutex::new(i2c));
     spawner.spawn(bme280_task(I2cDevice::new(bus)).unwrap());
 
@@ -391,6 +545,8 @@ async fn main(spawner: Spawner) {
     let trig = Output::new(p.PIN_15, Level::Low);
     let echo = Input::new(p.PIN_14, Pull::None);
     spawner.spawn(range_task(trig, echo).unwrap());
+
+    spawner.spawn(display_task(I2cDevice::new(bus)).unwrap());
 
     log::info!("boot: pico-telemetry-hub");
     if let Some(msg) = panic_persist::get_panic_message_utf8() {
@@ -484,8 +640,10 @@ async fn main(spawner: Spawner) {
         let mut rx_buf = [0u8; 512];
         let mut tx_buf = [0u8; 512];
         let mut sub: TelemetrySub = TELEMETRY.subscriber().unwrap();
+        let link_tx = TELEMETRY.immediate_publisher();
 
         loop {
+            link_tx.publish_immediate(Measurement::Uplink(UplinkState::Down));
             log::info!("connecting to broker...");
             let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
             socket.set_timeout(Some(Duration::from_secs(10)));
@@ -498,6 +656,7 @@ async fn main(spawner: Spawner) {
                         blink_n(&mut control, 4).await; // 4 blinks = MQTT session failed
                         control.gpio_set(0, true).await;
                     }
+                    link_tx.publish_immediate(Measurement::Uplink(UplinkState::Down));
                     UPLINK_UP.store(false, Ordering::Release);
                     stage.set_low();
                     socket.abort();

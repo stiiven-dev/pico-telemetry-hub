@@ -46,6 +46,6 @@ portable-atomic = { version = "1", default-features = false, features = [
     "critical-section",
 ] }
 
-#embedded-graphics = "0.8.2"
-#ssd1306 = "0.10.0"
+embedded-graphics = "0.8.2"
+ssd1306 = { version = "0.10.0" , features = ["async"]}
 bme280-rs = {version = "0.4.1", default-features = false , features = ["async"] }
