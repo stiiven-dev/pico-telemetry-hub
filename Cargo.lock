@@ -952,6 +952,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hub-config"
+version = "0.1.0"
+
+[[package]]
 name = "ident_case"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1321,6 +1325,7 @@ dependencies = [
  "embedded-graphics",
  "embedded-hal-async",
  "heapless",
+ "hub-config",
  "log",
  "motion-core",
  "mqtt-lite",

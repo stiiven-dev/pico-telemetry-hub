@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+mod config_store;
 mod imu;
 
 use core::fmt::Write as _;
@@ -9,6 +10,8 @@ use core::str::FromStr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use bme280_rs::{AsyncBme280, Configuration, Oversampling, SensorMode, CHIP_ID};
+use config_store::{Loaded, Store};
+use hub_config::Config as ConfigHub;
 use motion_core::{Calibrator, ComplementaryFilter, MedianFilter, NO_READING};
 use srf05::{EdgeCapture, Reading};
 
@@ -50,7 +53,6 @@ const BROKER_IP: &str = match option_env!("BROKER_IP") {
     Some(s) => s,
     None => "",
 };
-const BROKER_PORT: u16 = 1883;
 const RANGE_MEDIAN_N: usize = 5; //must be odd
 
 bind_interrupts!(struct Irqs {
@@ -94,7 +96,7 @@ static TELEMETRY: PubSubChannel<CriticalSectionRawMutex, Measurement, 8, 2, 4> =
 type TelemetrySub = Subscriber<'static, CriticalSectionRawMutex, Measurement, 8, 2, 4>;
 
 #[embassy_executor::task]
-async fn bme280_task(i2c: SharedI2c) {
+async fn bme280_task(i2c: SharedI2c, interval_s: u64) {
     let tx = TELEMETRY.immediate_publisher();
     let mut bme = AsyncBme280::new(i2c, Delay);
 
@@ -132,7 +134,7 @@ async fn bme280_task(i2c: SharedI2c) {
             },
             Err(_) => tx.publish_immediate(Measurement::Log("bme280: read failed")),
         }
-        Timer::after_secs(2).await;
+        Timer::after_secs(interval_s).await;
     }
 }
 
@@ -521,12 +523,37 @@ async fn mqtt_session(
     }
 }
 
+fn dev_config_from_env() -> Option<ConfigHub> {
+    let ip = Ipv4Addr::from_str(BROKER_IP).ok()?;
+    ConfigHub::new(SSID, PASS, ip.octets(), 1883, 2).ok()
+}
+
 #[embassy_executor::main(
     executor = "embassy_rp::executor::Executor",
     entry = "cortex_m_rt::entry"
 )]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
+
+    let mut flash = Store::new_blocking(p.FLASH);
+    let mut loaded = config_store::load(&mut flash);
+
+    // Dev convenience: credentials baked in at build time are authoritative
+    // and get persisted (only when they differ from what's stored).
+    if let Some(env_cfg) = dev_config_from_env() {
+        let current = loaded.as_ref().map(|l| (l.slot, l.seq));
+        let same = loaded.as_ref().map_or(false, |l| l.config == env_cfg);
+        if !same {
+            if let Ok((slot, seq)) = config_store::save(&mut flash, &env_cfg, current) {
+                loaded = Some(Loaded {
+                    slot,
+                    seq,
+                    config: env_cfg,
+                });
+            }
+        }
+    }
+    let interval_s = loaded.as_ref().map_or(2, |l| l.config.interval_s) as u64;
 
     // GP12: reset button when pressed
     let btn = Input::new(p.PIN_12, Pull::Up);
@@ -537,7 +564,7 @@ async fn main(spawner: Spawner) {
     i2c_cfg.frequency = 400_000;
     let i2c = I2c::new_async(p.I2C0, p.PIN_5, p.PIN_4, Irqs, i2c_cfg);
     let bus: &'static I2cBus = I2C_BUS.init(Mutex::new(i2c));
-    spawner.spawn(bme280_task(I2cDevice::new(bus)).unwrap());
+    spawner.spawn(bme280_task(I2cDevice::new(bus), interval_s).unwrap());
 
     let imu_int = Input::new(p.PIN_16, Pull::None);
     spawner.spawn(imu_task(I2cDevice::new(bus), imu_int).unwrap());
@@ -584,13 +611,13 @@ async fn main(spawner: Spawner) {
     log::info!("cyw43 initialised");
 
     stage.set_low();
-    if SSID.is_empty() {
-        // built without credentials: 5 blinks, repeat forever
+
+    let Some(Loaded { config: cfg, .. }) = loaded else {
         loop {
-            blink_n(&mut control, 5).await;
+            blink_n(&mut control, 5).await; // no configuration at all
             Timer::after_secs(2).await;
         }
-    }
+    };
 
     static RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
     let (stack, net_runner) = embassy_net::new(
@@ -603,9 +630,12 @@ async fn main(spawner: Spawner) {
     spawner.spawn(net_task(net_runner).unwrap());
 
     loop {
-        match control.join(SSID, JoinOptions::new(PASS.as_bytes())).await {
+        match control
+            .join(cfg.ssid(), JoinOptions::new(cfg.pass().as_bytes()))
+            .await
+        {
             Ok(_) => {
-                log::info!("joined '{}'", SSID);
+                log::info!("joined '{}'", cfg.ssid());
                 break;
             }
             Err(e) => {
@@ -626,16 +656,10 @@ async fn main(spawner: Spawner) {
     control.gpio_set(0, true).await; // solid on = has IP
 
     loop {
-        let ip = match Ipv4Addr::from_str(BROKER_IP) {
-            Ok(ip) => ip,
-            Err(_) => loop {
-                // missing or invalid BROKER_IP: 7 blinks, repeat
-                blink_n(&mut control, 7).await;
-                Timer::after_secs(2).await;
-            },
-        };
-        let o = ip.octets();
-        let broker = (Ipv4Address::new(o[0], o[1], o[2], o[3]), BROKER_PORT);
+        let broker = (
+            Ipv4Address::new(cfg.broker[0], cfg.broker[1], cfg.broker[2], cfg.broker[3]),
+            cfg.port,
+        );
 
         let mut rx_buf = [0u8; 512];
         let mut tx_buf = [0u8; 512];

@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 srf05 = { path = "../crates/srf05" }
 motion-core = { path = "../crates/motion-core" }
 mqtt-lite = { path = "../crates/mqtt-lite" }
+hub-config = { path = "../crates/hub-config" }
 
 embassy-executor = "0.10.0"
 embassy-time = "0.5.1"
