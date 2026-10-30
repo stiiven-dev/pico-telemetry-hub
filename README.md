@@ -95,7 +95,7 @@ docker compose exec mosquitto mosquitto_sub -t 'hub/#' -v
 ```
 
 | Topic | Content |
-|---|---|
+| --- | --- |
 | `hub/bme280` | `{"t_c":..,"rh":..,"p_hpa":..}` every interval |
 | `hub/imu` | `{"pitch":..,"roll":..}` at ~5 Hz |
 | `hub/range` | `{"mm":..}` (null when out of range) |

@@ -7,30 +7,33 @@ mod imu;
 use core::fmt::Write as _;
 use core::net::Ipv4Addr;
 use core::str::FromStr;
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use bme280_rs::{AsyncBme280, Configuration, Oversampling, SensorMode, CHIP_ID};
 use config_store::{Loaded, Store};
 use hub_config::Config as ConfigHub;
 use motion_core::{Calibrator, ComplementaryFilter, MedianFilter, NO_READING};
+use mqtt_lite::backoff::{jitter, Backoff};
 use srf05::{EdgeCapture, Reading};
 
 use cyw43::{aligned_bytes, JoinOptions};
 use cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER};
 use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
 use embassy_executor::Spawner;
-use embassy_net::{tcp::TcpSocket, Config, Ipv4Address, StackResources};
+use embassy_futures::select::{select, Either};
+use embassy_net::{tcp::TcpSocket, Config, Ipv4Address, Stack, StackResources};
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::i2c::{self, I2c};
 use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, I2C0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
+use embassy_rp::watchdog::{ResetReason, Watchdog};
 use embassy_rp::{bind_interrupts, dma};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::pubsub::{PubSubChannel, Subscriber};
 use embassy_time::{block_for, with_timeout, Delay, Duration, Instant, Ticker, Timer};
 use panic_persist as _;
+use portable_atomic::{AtomicU8, Ordering};
 use static_cell::StaticCell;
 
 use embedded_graphics::{
@@ -54,6 +57,12 @@ const BROKER_IP: &str = match option_env!("BROKER_IP") {
     None => "",
 };
 const RANGE_MEDIAN_N: usize = 5; //must be odd
+const HB_BME: u8 = 1 << 0;
+const HB_IMU: u8 = 1 << 1;
+const HB_RANGE: u8 = 1 << 2;
+const HB_DISPLAY: u8 = 1 << 3;
+const HB_UPLINK: u8 = 1 << 4;
+const HB_ALL: u8 = 0b1_1111;
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
@@ -64,7 +73,7 @@ bind_interrupts!(struct Irqs {
 type I2cBus = Mutex<CriticalSectionRawMutex, I2c<'static, I2C0, i2c::Async>>;
 type SharedI2c = I2cDevice<'static, CriticalSectionRawMutex, I2c<'static, I2C0, i2c::Async>>;
 static I2C_BUS: StaticCell<I2cBus> = StaticCell::new();
-static UPLINK_UP: AtomicBool = AtomicBool::new(false);
+static ALIVE: AtomicU8 = AtomicU8::new(0);
 
 #[derive(Clone, Copy, PartialEq)]
 enum UplinkState {
@@ -99,6 +108,7 @@ type TelemetrySub = Subscriber<'static, CriticalSectionRawMutex, Measurement, 8,
 async fn bme280_task(i2c: SharedI2c, interval_s: u64) {
     let tx = TELEMETRY.immediate_publisher();
     let mut bme = AsyncBme280::new(i2c, Delay);
+    beat(HB_BME);
 
     loop {
         match bme.chip_id().await {
@@ -134,17 +144,13 @@ async fn bme280_task(i2c: SharedI2c, interval_s: u64) {
             },
             Err(_) => tx.publish_immediate(Measurement::Log("bme280: read failed")),
         }
-        Timer::after_secs(interval_s).await;
+        sleep_beating(HB_BME, interval_s as u32).await;
     }
 }
 
 #[embassy_executor::task]
 async fn imu_task(mut i2c: SharedI2c, mut int: Input<'static>) {
     let tx = TELEMETRY.immediate_publisher();
-
-    while !UPLINK_UP.load(Ordering::Acquire) {
-        Timer::after_millis(200).await;
-    }
 
     loop {
         match imu::init(&mut i2c).await {
@@ -154,17 +160,20 @@ async fn imu_task(mut i2c: SharedI2c, mut int: Input<'static>) {
             }
             Err(_) => tx.publish_immediate(Measurement::Log("imu: no i2c response")),
         }
+        beat(HB_IMU);
         Timer::after_secs(5).await;
     }
 
     tx.publish_immediate(Measurement::Log("imu: calibrating, keep still and level"));
     let mut calibrator = Calibrator::<200>::new();
     let cal = loop {
+        beat(HB_IMU);
         if with_timeout(Duration::from_millis(100), int.wait_for_rising_edge())
             .await
             .is_err()
         {
             tx.publish_immediate(Measurement::Log("imu: no data-ready interrupt"));
+            beat(HB_IMU);
             Timer::after_secs(2).await;
             continue;
         }
@@ -183,11 +192,13 @@ async fn imu_task(mut i2c: SharedI2c, mut int: Input<'static>) {
     let mut last = Instant::now();
     let mut n: u32 = 0;
     loop {
+        beat(HB_IMU);
         if with_timeout(Duration::from_millis(100), int.wait_for_rising_edge())
             .await
             .is_err()
         {
             tx.publish_immediate(Measurement::Log("imu: no data-ready interrupt"));
+            beat(HB_IMU);
             Timer::after_secs(2).await;
             continue;
         }
@@ -223,6 +234,7 @@ async fn range_task(mut trig: Output<'static>, mut echo: Input<'static>) {
     let mut median = MedianFilter::<RANGE_MEDIAN_N>::new();
 
     loop {
+        beat(HB_RANGE);
         // ECHO must be idle-low before we ping
         if with_timeout(Duration::from_millis(40), echo.wait_for_low())
             .await
@@ -292,6 +304,7 @@ async fn display_task(i2c: SharedI2c) {
         .into_buffered_graphics_mode();
 
     loop {
+        beat(HB_DISPLAY);
         match display.init().await {
             Ok(()) => break,
             Err(_) => {
@@ -306,6 +319,7 @@ async fn display_task(i2c: SharedI2c) {
     let mut tick = Ticker::every(Duration::from_millis(250));
 
     loop {
+        beat(HB_DISPLAY);
         // Fold in everything that arrived since the last redraw
         while let Some(m) = sub.try_next_message_pure() {
             match m {
@@ -414,6 +428,20 @@ async fn bootsel_task(mut btn: embassy_rp::gpio::Input<'static>) {
     embassy_rp::rom_data::reset_to_usb_boot(0, 0);
 }
 
+#[embassy_executor::task]
+async fn watchdog_task(mut wd: Watchdog) {
+    wd.start(Duration::from_secs(8));
+    let mut seen = 0u8;
+    loop {
+        Timer::after_millis(250).await;
+        seen |= ALIVE.swap(0, Ordering::Relaxed);
+        if seen & HB_ALL == HB_ALL {
+            wd.feed(Duration::from_secs(8));
+            seen = 0;
+        }
+    }
+}
+
 async fn blink_n(control: &mut cyw43::Control<'_>, n: u8) {
     for _ in 0..n {
         control.gpio_set(0, true).await;
@@ -456,6 +484,7 @@ async fn mqtt_session(
     socket: &mut TcpSocket<'_>,
     stage: &mut Output<'_>,
     sub: &mut TelemetrySub,
+    pending: &mut Option<&'static str>,
 ) -> Result<(), &'static str> {
     let mut pkt = [0u8; 128];
 
@@ -465,25 +494,30 @@ async fn mqtt_session(
         .map_err(|_| "send connect")?;
 
     let mut ack = [0u8; 4];
-    with_timeout(Duration::from_secs(5), read_exact(socket, &mut ack))
+    with_timeout(Duration::from_secs(3), read_exact(socket, &mut ack))
         .await
         .map_err(|_| "connack timeout")?
         .map_err(|_| "connack read")?;
     mqtt_lite::check_connack(&ack).map_err(|_| "connack refused")?;
-    log::info!("mqtt connected");
-    TELEMETRY
-        .immediate_publisher()
-        .publish_immediate(Measurement::Uplink(UplinkState::Up));
-    TELEMETRY
-        .immediate_publisher()
-        .publish_immediate(Measurement::Uplink(UplinkState::Up));
     stage.set_high(); // GP13 on = MQTT session up
+    log::info!("mqtt connected");
 
-    while sub.try_next_message_pure().is_some() {} // drop reading queued while offline
-    UPLINK_UP.store(true, Ordering::Release);
+    while sub.try_next_message_pure().is_some() {} // 1. drain first
+
+    let tx = TELEMETRY.immediate_publisher(); // 2. then announce
+    tx.publish_immediate(Measurement::Uplink(UplinkState::Up));
+    if let Some(note) = pending.take() {
+        tx.publish_immediate(Measurement::Log(note)); // goes out to hub/log via the loop below
+    }
 
     loop {
-        let n = match sub.next_message_pure().await {
+        beat(HB_UPLINK);
+        let msg = match with_timeout(Duration::from_secs(3), sub.next_message_pure()).await {
+            Ok(m) => m,
+            Err(_) => continue, // nothing to send for 3 s: just beat again
+        };
+
+        let n = match msg {
             Measurement::Bme280 {
                 temp_c,
                 rh,
@@ -523,17 +557,100 @@ async fn mqtt_session(
     }
 }
 
+async fn bring_up_network(
+    control: &mut cyw43::Control<'_>,
+    stack: Stack<'static>,
+    cfg: &ConfigHub,
+) -> Result<(), &'static str> {
+    if !stack.is_link_up() {
+        with_timeout(
+            Duration::from_secs(4),
+            control.join(cfg.ssid(), JoinOptions::new(cfg.pass().as_bytes())),
+        )
+        .await
+        .map_err(|_| "wifi: join timeout")?
+        .map_err(|_| "wifi: join failed")?;
+    }
+    beat(HB_UPLINK);
+    with_timeout(Duration::from_secs(4), async {
+        stack.wait_link_up().await;
+        stack.wait_config_up().await;
+    })
+    .await
+    .map_err(|_| "net: no dhcp lease")?;
+    Ok(())
+}
+
+/// One attempt: network, TCP, MQTT session. Returns why it ended.
+async fn run_once(
+    control: &mut cyw43::Control<'_>,
+    stack: Stack<'static>,
+    cfg: &ConfigHub,
+    broker: (Ipv4Address, u16),
+    rx_buf: &mut [u8],
+    tx_buf: &mut [u8],
+    stage: &mut Output<'_>,
+    sub: &mut TelemetrySub,
+    pending: &mut Option<&'static str>,
+    session_len: &mut Option<Duration>,
+) -> &'static str {
+    if let Err(why) = bring_up_network(control, stack, cfg).await {
+        return why;
+    }
+    beat(HB_UPLINK);
+
+    let mut socket = TcpSocket::new(stack, rx_buf, tx_buf);
+    socket.set_timeout(Some(Duration::from_secs(10)));
+    match with_timeout(Duration::from_secs(4), socket.connect(broker)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return "tcp: connect failed",
+        Err(_) => return "tcp: connect timeout",
+    }
+
+    let started = Instant::now();
+    // End the session as soon as either MQTT fails or the Wi-Fi link drops
+    let why = match select(
+        mqtt_session(&mut socket, stage, sub, pending),
+        stack.wait_link_down(),
+    )
+    .await
+    {
+        Either::First(Err(why)) => why,
+        Either::First(Ok(())) => "mqtt: session ended",
+        Either::Second(()) => "wifi: link lost",
+    };
+    *session_len = Some(started.elapsed());
+
+    socket.abort();
+    let _ = with_timeout(Duration::from_secs(1), socket.flush()).await;
+    why
+}
+
 fn dev_config_from_env() -> Option<ConfigHub> {
     let ip = Ipv4Addr::from_str(BROKER_IP).ok()?;
     ConfigHub::new(SSID, PASS, ip.octets(), 1883, 2).ok()
 }
 
+fn beat(bit: u8) {
+    ALIVE.fetch_or(bit, Ordering::Relaxed);
+}
+
+/// Sleep for `secs`, reporting in every second.
+async fn sleep_beating(bit: u8, secs: u32) {
+    for _ in 0..secs {
+        beat(bit);
+        Timer::after_secs(1).await;
+    }
+}
 #[embassy_executor::main(
     executor = "embassy_rp::executor::Executor",
     entry = "cortex_m_rt::entry"
 )]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
+
+    let wd = Watchdog::new(p.WATCHDOG);
+    let wd_reset = wd.reset_reason() == Some(ResetReason::TimedOut);
 
     let mut flash = Store::new_blocking(p.FLASH);
     let mut loaded = config_store::load(&mut flash);
@@ -655,44 +772,67 @@ async fn main(spawner: Spawner) {
     }
     control.gpio_set(0, true).await; // solid on = has IP
 
+    let mut sub: TelemetrySub = TELEMETRY.subscriber().unwrap();
+    let broker = (
+        Ipv4Address::new(cfg.broker[0], cfg.broker[1], cfg.broker[2], cfg.broker[3]),
+        cfg.port,
+    );
+    let mut rx_buf = [0u8; 512];
+    let mut tx_buf = [0u8; 512];
+    let link_tx = TELEMETRY.immediate_publisher();
+    let mut backoff = Backoff::new(1_000, 30_000);
+    let mut last_ok = Instant::now();
+    let mut pending: Option<&'static str> = if wd_reset {
+        Some("boot: previous reset by watchdog")
+    } else {
+        None
+    };
+
+    spawner.spawn(watchdog_task(wd).unwrap()); // start guarding only now that bring-up is done
+
     loop {
-        let broker = (
-            Ipv4Address::new(cfg.broker[0], cfg.broker[1], cfg.broker[2], cfg.broker[3]),
-            cfg.port,
-        );
+        beat(HB_UPLINK);
+        link_tx.publish_immediate(Measurement::Uplink(UplinkState::Down));
 
-        let mut rx_buf = [0u8; 512];
-        let mut tx_buf = [0u8; 512];
-        let mut sub: TelemetrySub = TELEMETRY.subscriber().unwrap();
-        let link_tx = TELEMETRY.immediate_publisher();
+        let mut session_len = None;
+        let why = run_once(
+            &mut control,
+            stack,
+            &cfg,
+            broker,
+            &mut rx_buf,
+            &mut tx_buf,
+            &mut stage,
+            &mut sub,
+            &mut pending,
+            &mut session_len,
+        )
+        .await;
 
-        loop {
-            link_tx.publish_immediate(Measurement::Uplink(UplinkState::Down));
-            log::info!("connecting to broker...");
-            let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
-            socket.set_timeout(Some(Duration::from_secs(10)));
+        link_tx.publish_immediate(Measurement::Uplink(UplinkState::Down));
+        stage.set_low();
+        pending = Some(why); // reported to hub/log once the next session is up
+        log::warn!("uplink: {}", why);
 
-            match socket.connect(broker).await {
-                Ok(()) => {
-                    log::info!("tcp connected");
-                    if let Err(why) = mqtt_session(&mut socket, &mut stage, &mut sub).await {
-                        log::warn!("mqtt session ended: {}", why);
-                        blink_n(&mut control, 4).await; // 4 blinks = MQTT session failed
-                        control.gpio_set(0, true).await;
-                    }
-                    link_tx.publish_immediate(Measurement::Uplink(UplinkState::Down));
-                    UPLINK_UP.store(false, Ordering::Release);
-                    stage.set_low();
-                    socket.abort();
-                    let _ = socket.flush().await;
-                }
-                Err(e) => {
-                    log::warn!("tcp connect failed: {:?}", e);
-                    blink_n(&mut control, 2).await;
-                    control.gpio_set(0, true).await;
-                }
+        if matches!(session_len, Some(d) if d >= Duration::from_secs(30)) {
+            backoff.reset();
+            last_ok = Instant::now();
+        }
+
+        // No working session for 5 minutes: stop beating and let the watchdog reset us
+        if last_ok.elapsed() > Duration::from_secs(300) {
+            loop {
+                Timer::after_secs(1).await; // no beat(HB_UPLINK): reset within ~8 s
             }
-            Timer::after_secs(3).await;
+        }
+
+        let delay_ms = jitter(backoff.next_delay_ms(), rosc_seed() as u32);
+        let mut left = delay_ms;
+        while left > 0 {
+            beat(HB_UPLINK);
+            let step = left.min(1000);
+            Timer::after_millis(step as u64).await;
+            left -= step;
         }
     }
 }

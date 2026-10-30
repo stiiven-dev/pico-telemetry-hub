@@ -1,5 +1,7 @@
 #![cfg_attr(not(test), no_std)]
 
+pub mod backoff;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     BufferTooSmall,
