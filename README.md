@@ -29,8 +29,8 @@ Wi-Fi-connected sensor node publishing BME280, MPU-6050, and SRF05 telemetry ove
 - [x] MQTT publish of one sensor (BME280)
 - [x] all three sensors flowing through a shared `PubSubChannel` (OLED as second subscriber)
 - [x] flash-backed config store (A/B slots, host-tested `hub-config`)
-- [ ] reconnection backoff + watchdog, chaos-tested (pull the router mid-run)
-- [ ] Grafana dashboard (`docker-compose.yml` with Mosquitto already works)
+- [x] reconnection backoff + watchdog, chaos-tested (pull the router mid-run)
+- [x] Grafana dashboard (`docker-compose.yml` with Mosquitto already works)
 - [ ] CI check: no hardcoded Wi-Fi credentials committed
 - [ ] `docs/adr/` — architecture decision records
 - [ ] firmware version + git hash in the MQTT birth message
