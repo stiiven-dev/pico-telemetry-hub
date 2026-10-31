@@ -63,6 +63,7 @@ const HB_RANGE: u8 = 1 << 2;
 const HB_DISPLAY: u8 = 1 << 3;
 const HB_UPLINK: u8 = 1 << 4;
 const HB_ALL: u8 = 0b1_1111;
+const WD_MAGIC: u32 = 0xB17E_0000;
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
@@ -103,6 +104,7 @@ enum Measurement {
 static TELEMETRY: PubSubChannel<CriticalSectionRawMutex, Measurement, 8, 2, 4> =
     PubSubChannel::new();
 type TelemetrySub = Subscriber<'static, CriticalSectionRawMutex, Measurement, 8, 2, 4>;
+type Notes = heapless::Deque<&'static str, 4>;
 
 #[embassy_executor::task]
 async fn bme280_task(i2c: SharedI2c, interval_s: u64) {
@@ -128,6 +130,7 @@ async fn bme280_task(i2c: SharedI2c, interval_s: u64) {
                 tx.publish_immediate(Measurement::Log("bme280: init failed"));
             }
         }
+        beat(HB_BME);
         Timer::after_secs(5).await;
     }
     Timer::after_millis(50).await;
@@ -435,6 +438,7 @@ async fn watchdog_task(mut wd: Watchdog) {
     loop {
         Timer::after_millis(250).await;
         seen |= ALIVE.swap(0, Ordering::Relaxed);
+        wd.set_scratch(0, WD_MAGIC | seen as u32);
         if seen & HB_ALL == HB_ALL {
             wd.feed(Duration::from_secs(8));
             seen = 0;
@@ -459,14 +463,19 @@ fn rosc_seed() -> u64 {
     s
 }
 
-async fn send_all(socket: &mut TcpSocket<'_>, mut data: &[u8]) -> Result<(), ()> {
-    while !data.is_empty() {
-        match socket.write(data).await {
-            Ok(0) | Err(_) => return Err(()),
-            Ok(n) => data = &data[n..],
+async fn send_all(socket: &mut TcpSocket<'_>, data: &[u8]) -> Result<(), ()> {
+    with_timeout(Duration::from_secs(3), async {
+        let mut data = data;
+        while !data.is_empty() {
+            match socket.write(data).await {
+                Ok(0) | Err(_) => return Err(()),
+                Ok(n) => data = &data[n..],
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
+    .unwrap_or(Err(()))
 }
 
 async fn read_exact(socket: &mut TcpSocket<'_>, buf: &mut [u8]) -> Result<(), ()> {
@@ -484,7 +493,7 @@ async fn mqtt_session(
     socket: &mut TcpSocket<'_>,
     stage: &mut Output<'_>,
     sub: &mut TelemetrySub,
-    pending: &mut Option<&'static str>,
+    pending: &mut Notes,
 ) -> Result<(), &'static str> {
     let mut pkt = [0u8; 128];
 
@@ -506,8 +515,8 @@ async fn mqtt_session(
 
     let tx = TELEMETRY.immediate_publisher(); // 2. then announce
     tx.publish_immediate(Measurement::Uplink(UplinkState::Up));
-    if let Some(note) = pending.take() {
-        tx.publish_immediate(Measurement::Log(note)); // goes out to hub/log via the loop below
+    while let Some(note) = pending.pop_front() {
+        tx.publish_immediate(Measurement::Log(note));
     }
 
     loop {
@@ -591,7 +600,7 @@ async fn run_once(
     tx_buf: &mut [u8],
     stage: &mut Output<'_>,
     sub: &mut TelemetrySub,
-    pending: &mut Option<&'static str>,
+    pending: &mut Notes,
     session_len: &mut Option<Duration>,
 ) -> &'static str {
     if let Err(why) = bring_up_network(control, stack, cfg).await {
@@ -649,8 +658,29 @@ async fn sleep_beating(bit: u8, secs: u32) {
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
-    let wd = Watchdog::new(p.WATCHDOG);
-    let wd_reset = wd.reset_reason() == Some(ResetReason::TimedOut);
+    let mut wd = Watchdog::new(p.WATCHDOG);
+    let wd_note: Option<&'static str> = if wd.reset_reason() == Some(ResetReason::TimedOut) {
+        let raw = wd.get_scratch(0);
+        wd.set_scratch(0, 0); // consume it so it can't go stale
+        let missing = HB_ALL & !(raw as u8);
+        Some(if raw & 0xFFFF_0000 != WD_MAGIC {
+            "boot: watchdog reset"
+        } else if missing & HB_UPLINK != 0 {
+            "boot: watchdog reset, uplink silent"
+        } else if missing & HB_IMU != 0 {
+            "boot: watchdog reset, imu silent"
+        } else if missing & HB_BME != 0 {
+            "boot: watchdog reset, bme280 silent"
+        } else if missing & HB_RANGE != 0 {
+            "boot: watchdog reset, range silent"
+        } else if missing & HB_DISPLAY != 0 {
+            "boot: watchdog reset, display silent"
+        } else {
+            "boot: watchdog reset"
+        })
+    } else {
+        None
+    };
 
     let mut flash = Store::new_blocking(p.FLASH);
     let mut loaded = config_store::load(&mut flash);
@@ -746,32 +776,6 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(net_task(net_runner).unwrap());
 
-    loop {
-        match control
-            .join(cfg.ssid(), JoinOptions::new(cfg.pass().as_bytes()))
-            .await
-        {
-            Ok(_) => {
-                log::info!("joined '{}'", cfg.ssid());
-                break;
-            }
-            Err(e) => {
-                log::warn!("join failed: {:?}", e);
-                blink_n(&mut control, 3).await;
-                Timer::after_secs(2).await;
-            }
-        }
-    }
-
-    // Fast blink while waiting for link + DHCP lease; each blink runs to completion
-    while !(stack.is_link_up() && stack.is_config_up()) {
-        blink_n(&mut control, 1).await;
-    }
-    if let Some(cfg) = stack.config_v4() {
-        log::info!("got IP {}", cfg.address);
-    }
-    control.gpio_set(0, true).await; // solid on = has IP
-
     let mut sub: TelemetrySub = TELEMETRY.subscriber().unwrap();
     let broker = (
         Ipv4Address::new(cfg.broker[0], cfg.broker[1], cfg.broker[2], cfg.broker[3]),
@@ -782,11 +786,10 @@ async fn main(spawner: Spawner) {
     let link_tx = TELEMETRY.immediate_publisher();
     let mut backoff = Backoff::new(1_000, 30_000);
     let mut last_ok = Instant::now();
-    let mut pending: Option<&'static str> = if wd_reset {
-        Some("boot: previous reset by watchdog")
-    } else {
-        None
-    };
+    let mut pending = Notes::new();
+    if let Some(n) = wd_note {
+        let _ = pending.push_back(n);
+    }
 
     spawner.spawn(watchdog_task(wd).unwrap()); // start guarding only now that bring-up is done
 
@@ -811,7 +814,10 @@ async fn main(spawner: Spawner) {
 
         link_tx.publish_immediate(Measurement::Uplink(UplinkState::Down));
         stage.set_low();
-        pending = Some(why); // reported to hub/log once the next session is up
+        if pending.is_full() {
+            pending.pop_front();
+        }
+        let _ = pending.push_back(why);
         log::warn!("uplink: {}", why);
 
         if matches!(session_len, Some(d) if d >= Duration::from_secs(30)) {
